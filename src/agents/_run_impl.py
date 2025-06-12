@@ -176,6 +176,11 @@ class NextStepHandoff:
 
 
 @dataclass
+class NextStepHandoffReturnControl:
+    previous_agent: Agent[Any]
+
+
+@dataclass
 class NextStepFinalOutput:
     output: Any
 
@@ -237,6 +242,7 @@ class RunImpl:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
+        previous_agents: list[Agent],
     ) -> SingleStepResult:
         # Make a copy of the generated items
         pre_step_items = list(pre_step_items)
@@ -285,6 +291,7 @@ class RunImpl:
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 run_config=run_config,
+                previous_agents=previous_agents,
             )
 
         # Next, we'll check if the tool use should result in a final output
@@ -315,6 +322,7 @@ class RunImpl:
                 final_output=check_tool_use.final_output,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
+                previous_agents=previous_agents,
             )
 
         # Now we can check if the model also produced a final output
@@ -339,6 +347,7 @@ class RunImpl:
                 final_output=final_output,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
+                previous_agents=previous_agents,
             )
         elif (
             not output_schema or output_schema.is_plain_text()
@@ -352,6 +361,7 @@ class RunImpl:
                 final_output=potential_final_output_text or "",
                 hooks=hooks,
                 context_wrapper=context_wrapper,
+                previous_agents=previous_agents,
             )
         else:
             # If there's no final output, we can just run again
@@ -659,6 +669,7 @@ class RunImpl:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         run_config: RunConfig,
+        previous_agents: list[Agent[TContext]],
     ) -> SingleStepResult:
         # If there is more than one handoff, add tool responses that reject those handoffs
         multiple_handoffs = len(run_handoffs) > 1
@@ -680,6 +691,8 @@ class RunImpl:
         actual_handoff = run_handoffs[0]
         with handoff_span(from_agent=agent.name) as span_handoff:
             handoff = actual_handoff.handoff
+            if handoff.should_return_control:
+                previous_agents.append(agent)
             new_agent: Agent[Any] = await handoff.on_invoke_handoff(
                 context_wrapper, actual_handoff.tool_call.arguments
             )
@@ -821,16 +834,21 @@ class RunImpl:
         final_output: Any,
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
+        previous_agents: list[Agent[TContext]],
     ) -> SingleStepResult:
+        is_returning_control = len(previous_agents) > 0
         # Run the on_end hooks
-        await cls.run_final_output_hooks(agent, hooks, context_wrapper, final_output)
-
+        await cls.run_final_output_hooks(
+            agent, hooks, context_wrapper, final_output, is_returning_control
+        )
         return SingleStepResult(
             original_input=original_input,
             model_response=new_response,
             pre_step_items=pre_step_items,
             new_step_items=new_step_items,
-            next_step=NextStepFinalOutput(final_output),
+            next_step=NextStepHandoffReturnControl(previous_agents.pop())
+            if is_returning_control
+            else NextStepFinalOutput(final_output),
         )
 
     @classmethod
@@ -840,13 +858,19 @@ class RunImpl:
         hooks: RunHooks[TContext],
         context_wrapper: RunContextWrapper[TContext],
         final_output: Any,
+        is_returning_control: bool,
     ):
-        await asyncio.gather(
-            hooks.on_agent_end(context_wrapper, agent, final_output),
-            agent.hooks.on_end(context_wrapper, agent, final_output)
-            if agent.hooks
-            else _coro.noop_coroutine(),
-        )
+        # If the agent is not returning control, run the hooks
+        if not is_returning_control:
+            await asyncio.gather(
+                hooks.on_agent_end(context_wrapper, agent, final_output),
+                agent.hooks.on_end(context_wrapper, agent, final_output)
+                if agent.hooks
+                else _coro.noop_coroutine(),
+            )
+        # If the agent is returning control, only run the current agent's hooks
+        elif agent.hooks:
+            await agent.hooks.on_end(context_wrapper, agent, final_output)
 
     @classmethod
     async def run_single_input_guardrail(
